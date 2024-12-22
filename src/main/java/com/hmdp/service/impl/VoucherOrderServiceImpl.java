@@ -9,8 +9,11 @@ import com.hmdp.service.IVoucherOrderService;
 import com.baomidou.mybatisplus.extension.service.impl.ServiceImpl;
 import com.hmdp.service.IVoucherService;
 import com.hmdp.utils.RedisIdWorker;
+import com.hmdp.utils.SimpleRedisLock;
 import com.hmdp.utils.UserHolder;
 import org.springframework.aop.framework.AopContext;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.data.redis.core.StringRedisTemplate;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
 
@@ -32,6 +35,8 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
     private ISeckillVoucherService seckillVoucherService;
     @Resource
     private RedisIdWorker redisIdWorker;
+    @Autowired
+    private StringRedisTemplate stringRedisTemplate;
 
     @Transactional
     @Override
@@ -44,17 +49,25 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         if(voucher.getEndTime().isBefore(LocalDateTime.now())) return Result.fail("秒杀结束！");
         //判断库存是否充足
         if(voucher.getStock() < 1) return Result.fail("库存不足");
-        //扣减库存
-        boolean success = seckillVoucherService.update()
-                .setSql("stock = stock - 1")
-                .eq("voucher_id", voucherId).gt("stock", 0).update();
-        if(!success) return Result.fail("库存不足");
 
         Long userId = UserHolder.getUser().getId();
-        synchronized (userId.toString().intern()){
+
+        //创建锁对象 获取锁
+        SimpleRedisLock lock = new SimpleRedisLock("order:" + userId, stringRedisTemplate);
+
+        Boolean isLock = lock.tryLock(12L);
+        if(!isLock) {
+            //重试或者返回错误信息
+            return Result.fail("一个人只允许下一单！");
+        }
+        //获取代理对象
+        try {
             IVoucherOrderService proxy = (IVoucherOrderService)AopContext.currentProxy();
             return proxy.createVoucherOrder(voucherId); //非代理对象
+        } finally {
+            lock.unlock();
         }
+
     }
 
     @Transactional
@@ -65,6 +78,12 @@ public class VoucherOrderServiceImpl extends ServiceImpl<VoucherOrderMapper, Vou
         //intern 在字符串池里找有没有一样的
         int count = query().eq("user_id", userId).eq("voucher_id", voucherId).count();
         if(count > 0) return Result.fail("用户已购买过一次");
+
+        //扣减库存
+        boolean success = seckillVoucherService.update()
+                .setSql("stock = stock - 1")
+                .eq("voucher_id", voucherId).gt("stock", 0).update();
+        if(!success) return Result.fail("库存不足");
 
         //创建订单
         VoucherOrder voucherOrder = new VoucherOrder();
